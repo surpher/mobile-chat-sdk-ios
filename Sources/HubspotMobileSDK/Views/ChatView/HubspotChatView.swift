@@ -474,7 +474,12 @@ struct HubspotChatWebView: UIViewRepresentable {
                         // Now we know the id of newly selected thread, we can inform the manager which will handle next steps for data
                         manager.handleThreadOpened(threadId: String(conversationId))
                     #endif
+                } else {
+                    Task {
+                        await manager.sendChatProperties()
+                    }
                 }
+
             default:
                 manager.logger.warning("Message handled for handler \(handlerName, privacy: .public), but thats not a known handler - ignoring it, but if something else was expecting to handle it, there might be an issue")
             }

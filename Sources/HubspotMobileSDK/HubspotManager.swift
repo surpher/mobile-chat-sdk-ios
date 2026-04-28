@@ -507,6 +507,27 @@ public class HubspotManager: NSObject, ObservableObject {
             }
         }
     }
+
+    func sendChatProperties() async {
+        guard let portalId, let hubletModel else {
+            return
+        }
+
+        let props = await finalizeChatProperties()
+
+        do {
+            try await api.sendChatProperties(
+                hublet: hubletModel,
+                properties: props,
+                visitorIdToken: self.userIdentityToken,
+                email: self.userEmailAddress,
+                threadId: threadId,
+                portalId: portalId
+            )
+        } catch {
+            logger.error("Error sending chat properties: \(error)")
+        }
+    }
 }
 
 extension Image {
