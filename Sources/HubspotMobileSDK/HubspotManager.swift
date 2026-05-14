@@ -99,6 +99,13 @@ public class HubspotManager: NSObject, ObservableObject {
 
     private var api: HubspotAPI
 
+    /// Broadcasts a session-reset signal to the active chat view coordinator.
+    public let sessionResetSubject = PassthroughSubject<Void, Never>()
+
+    private var sessionResetCancellable: AnyCancellable?
+
+    // MARK: - Configuration
+
     /// Use the provided config values, applied to the shared instance ``shared``
     /// - Parameters:
     ///   - portalId: Your portal id - you can find it from your hubspot account page
@@ -177,6 +184,8 @@ public class HubspotManager: NSObject, ObservableObject {
         objectWillChange.send()
     }
 
+    // MARK: - Logging
+
     /// Convenience to set the logger to the disabled logger
     public func disableLogging() {
         logger = Logger(.disabled)
@@ -186,6 +195,8 @@ public class HubspotManager: NSObject, ObservableObject {
     public func enableLogging() {
         logger = createDefaultHubspotLogger()
     }
+
+    // MARK: - Push Tokens
 
     /// Set the push token for the app. Recommend calling this each app launch when push feature is enabled.
     /// - Parameter apnsPushToken: The data token provided by iOS via didRegisterForRemoteNotificationsWithDeviceToken
@@ -265,6 +276,8 @@ public class HubspotManager: NSObject, ObservableObject {
         }
     }
 
+    // MARK: - Identity
+
     /// Set the user id obtained from the [Visitor Identification API](https://developers.hubspot.com/docs/api/conversation/visitor-identification) , along with the users email address. These will be included when starting a chat session to identify the user. Its important to set these before starting a chat session, as they are needed during chat initialisation.
     ///
     /// Object will change is triggered after setting values, for anything that may be observing this manager with Combine or SwiftUI state
@@ -284,6 +297,8 @@ public class HubspotManager: NSObject, ObservableObject {
 
         sendPushTokenIfNeeded()
     }
+
+    // MARK: - Chat properties
 
     /// Set a string key and value collection to be associate with any chat opened.
     ///
@@ -406,6 +421,14 @@ public class HubspotManager: NSObject, ObservableObject {
         objectWillChange.send()
     }
 
+    /// Resets the active chat session so the next opened thread starts fresh.
+    ///
+    /// Call this before presenting a new chatflow when an existing session may already be active.
+    /// Mirrors the web SDK `window.HubSpotConversations.widget.refresh({ openToNewThread: true })` call.
+    public func resetSession() {
+        sessionResetSubject.send()
+    }
+
     /// Computes the url for the current config for embedding chat, based on any known config for portal id, hublet, user id, etc
     ///
     /// The chat view , ``HubspotChatView`` calls this method when setting up its embedded chat
@@ -517,6 +540,21 @@ extension Image {
 }
 
 extension HubspotManager {
+
+    /// Called by WebviewCoordinator when a WKWebView becomes active.
+    ///
+    /// The closure should call the JS refresh on the webView.
+    func registerSessionResetHandler(_ handler: @escaping () -> Void) {
+        sessionResetCancellable = sessionResetSubject
+            .receive(on: DispatchQueue.main)
+            .sink { handler() }
+    }
+
+    /// Should be called by WebviewCoordinator on deinit.
+    func clearSessionResetHandler() {
+        sessionResetCancellable = nil
+    }
+
     /// Create a visitor access token directly using app access token
     ///
     /// Convenience for creating a visitor identity token using the given details, for situations where server infrastructure isn't available during SDK development.

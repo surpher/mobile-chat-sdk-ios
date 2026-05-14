@@ -87,13 +87,12 @@ import WebKit
 ///
 /// > Important: HubspotChatView doesn't insert any close buttons when overlaid with sheet or full screen cover. Consider adding a close toolbar button if that is needed.
 ///
-///
-///
-///
 public struct HubspotChatView: View {
     private let manager: HubspotManager
     private let chatFlow: String?
     private let pushData: PushNotificationChatData?
+
+    weak var webView: WKWebView?
 
     /// If set , use a custom dismiss action, otherwise use environment dismiss
     private let customDismiss: (() -> Void)?
@@ -179,6 +178,8 @@ public struct HubspotChatView: View {
         }
     }
 
+    // MARK: - Private
+
     private func dismissChat() {
         if let customDismiss {
             manager.logger.trace("dismissing chat with custom action")
@@ -259,6 +260,18 @@ struct HubspotChatWebView: UIViewRepresentable {
 
         let webview = WKWebView(frame: .zero, configuration: configuration)
 
+        context.coordinator.webView = webview
+        manager.registerSessionResetHandler { [weak coordinator = context.coordinator] in
+            guard let webView = coordinator?.webView else { return }
+                webView.evaluateJavaScript(
+                    "window.HubSpotConversations?.widget?.refresh({ openToNewThread: true })"
+                ) { [weak coordinator] _, error in
+                    if let error {
+                        coordinator?.manager.logger.error("Error evaluating session reset JS: \(error)")
+                    }
+                }
+        }
+
         #if DEBUG
             // This allows safari
             if #available(iOS 16.4, *) {
@@ -318,7 +331,10 @@ struct HubspotChatWebView: UIViewRepresentable {
 
     /// The coordinator helps with the Swift View to UIView lifecycle , and stays alive (along with the UIKit views)  when the swift view itself may be recreated.
     /// This is the sensible place for our delegate callbacks
+    @MainActor
     class WebviewCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
+        weak var webView: WKWebView?
+
         let viewModel: ChatViewModel
         let manager: HubspotManager
 
@@ -504,6 +520,10 @@ struct HubspotChatWebView: UIViewRepresentable {
                 return .allow
             }
         }
+    }
+
+    static func dismantleUIView(_ uiView: WKWebView, coordinator: WebviewCoordinator) {
+        coordinator.manager.clearSessionResetHandler()
     }
 }
 
