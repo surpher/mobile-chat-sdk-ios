@@ -34,6 +34,7 @@ import SwiftUI
 public struct FloatingActionButton: View {
     private let manager: HubspotManager
     private let chatFlow: String?
+    private let openToNewThread: Bool
 
     @State var showingChat: Bool = false
 
@@ -41,12 +42,15 @@ public struct FloatingActionButton: View {
     /// - Parameters:
     ///   - manager: The manager to use for getting a chat session. By defautl the shared manager is used.
     ///   - chatFlow: The specific chat flow to open. Optional.
+    ///   - openToNewThread: Forces the widget to start a new conversation thread instead of resuming the visitor's last active thread - see ``HubspotChatView/init(manager:pushData:chatFlow:openToNewThread:dismissChat:)``. Defaults to `false`.
     public init(
         manager: HubspotManager? = nil,
-        chatFlow: String? = nil
+        chatFlow: String? = nil,
+        openToNewThread: Bool = false
     ) {
         self.manager = manager ?? HubspotManager.shared
         self.chatFlow = chatFlow
+        self.openToNewThread = openToNewThread
     }
 
     public var body: some View {
@@ -65,7 +69,7 @@ public struct FloatingActionButton: View {
         .sheet(
             isPresented: $showingChat,
             content: {
-                HubspotChatView(manager: manager, chatFlow: chatFlow)
+                HubspotChatView(manager: manager, chatFlow: chatFlow, openToNewThread: openToNewThread)
             }
         )
         .onAppear {
@@ -84,17 +88,19 @@ public struct FloatingActionButton: View {
 struct FloatingActionButtonOverlayModifier: ViewModifier {
     let manager: HubspotManager
     let chatFlow: String?
+    let openToNewThread: Bool
 
-    init(manager: HubspotManager? = nil, chatFlow: String? = nil) {
+    init(manager: HubspotManager? = nil, chatFlow: String? = nil, openToNewThread: Bool = false) {
         self.manager = manager ?? HubspotManager.shared
         self.chatFlow = chatFlow
+        self.openToNewThread = openToNewThread
     }
 
     func body(content: Content) -> some View {
         content.overlay(
             alignment: .bottomTrailing,
             content: {
-                FloatingActionButton(manager: manager, chatFlow: chatFlow)
+                FloatingActionButton(manager: manager, chatFlow: chatFlow, openToNewThread: openToNewThread)
                     .padding()
             }
         )
@@ -102,12 +108,19 @@ struct FloatingActionButtonOverlayModifier: ViewModifier {
 }
 
 extension View {
-    /// Convenience to overlay a floating action button - call on your main content view to overlay button at bottom trailing position with default padding. Set the `chatFlow` property to use a specific flow, otherwise the default flow from your configuration file will be used.
+    /// Convenience to overlay a floating action button - call on your main content view to overlay
+    /// button at bottom trailing position with default padding.
+    ///
+    /// Set the `chatFlow` property to use a specific flow, otherwise the default flow from your
+    /// configuration file will be used.
+    ///
     /// - Parameters:
     ///     - manager: The hubspot manager to use
     ///     - chatFlow: the chat flow targeting parameter to use
-    public func overlayHubspotFloatingActionButton(manager: HubspotManager? = nil, chatFlow: String? = nil) -> some View {
-        modifier(FloatingActionButtonOverlayModifier(manager: manager, chatFlow: chatFlow))
+    ///     - openToNewThread: Forces the widget to start a new conversation thread instead of resuming the
+    ///                        visitor's last active thread. Defaults to `false`.
+    public func overlayHubspotFloatingActionButton(manager: HubspotManager? = nil, chatFlow: String? = nil, openToNewThread: Bool = false) -> some View {
+        modifier(FloatingActionButtonOverlayModifier(manager: manager, chatFlow: chatFlow, openToNewThread: openToNewThread))
     }
 }
 

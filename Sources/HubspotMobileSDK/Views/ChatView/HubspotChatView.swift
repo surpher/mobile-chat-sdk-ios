@@ -94,6 +94,7 @@ public struct HubspotChatView: View {
     private let manager: HubspotManager
     private let chatFlow: String?
     private let pushData: PushNotificationChatData?
+    private let openToNewThread: Bool
 
     /// If set , use a custom dismiss action, otherwise use environment dismiss
     private let customDismiss: (() -> Void)?
@@ -110,16 +111,27 @@ public struct HubspotChatView: View {
     ///   - manager: manager to use when creating urls for account and getting user properties
     ///   - pushData: Struct containing any of the hubspot values from the push body payload.
     ///   - chatFlow: The specific chat flow to open, if any
-    ///   - dismissChat: If the chat has a close option, you can optionally set this closure to handle closing chat. If you do not set this, then the chat view will use the standard `dismiss` action from the SwiftUI environment - Use this if you show or embed the chat in some custom or non standard presentation.
+    ///   - openToNewThread: HubSpot's web widget resumes the visitor's most recently active conversation
+    ///                      thread when chat is opened, even if that thread belongs to a different chat
+    ///                      flow than the one requested here. Set this to `true` to force the widget to
+    ///                      start a new thread instead - for example, when your app knows it's switching
+    ///                      the user to a different chat flow than the one they last had open.
+    ///                      Defaults to `false`, which preserves the widget's normal resume behaviour.
+    ///   - dismissChat: If the chat has a close option, you can optionally set this closure to handle
+    ///                  closing chat. If you do not set this, then the chat view will use the standard
+    ///                  `dismiss` action from the SwiftUI environment - Use this if you show or embed
+    ///                  the chat in some custom or non standard presentation.
     public init(
         manager: HubspotManager? = nil,
         pushData: PushNotificationChatData? = nil,
         chatFlow: String? = nil,
+        openToNewThread: Bool = false,
         dismissChat: (() -> Void)? = nil
     ) {
         self.manager = manager ?? .shared
         self.chatFlow = chatFlow
         self.pushData = pushData
+        self.openToNewThread = openToNewThread
         customDismiss = dismissChat
     }
 
@@ -131,6 +143,7 @@ public struct HubspotChatView: View {
                 manager: manager,
                 pushData: pushData,
                 chatFlow: chatFlow,
+                openToNewThread: openToNewThread,
                 viewModel: viewModel,
                 dismissAction: {
                     dismissChat()
@@ -200,6 +213,7 @@ struct HubspotChatWebView: UIViewRepresentable {
     private let manager: HubspotManager
     private let chatFlow: String?
     private let pushData: PushNotificationChatData?
+    private let openToNewThread: Bool
 
     @Environment(\.openURL)
     var openURLAction
@@ -218,16 +232,20 @@ struct HubspotChatWebView: UIViewRepresentable {
     ///   - manager: manager to use when creating urls for account and getting user properties
     ///   - pushData: Struct containing any of the hubspot values from the push body payload.
     ///   - chatFlow: The specific chat flow to open, if any
+    ///   - openToNewThread: If true, forces the widget to start a new conversation thread once loaded,
+    ///                      instead of resuming the visitor's last active thread.
     init(
         manager: HubspotManager,
         pushData: PushNotificationChatData?,
         chatFlow: String?,
+        openToNewThread: Bool,
         viewModel: ChatViewModel,
         dismissAction: @escaping () -> Void
     ) {
         self.manager = manager
         self.chatFlow = chatFlow
         self.pushData = pushData
+        self.openToNewThread = openToNewThread
         self.viewModel = viewModel
         self.dismissAction = dismissAction
     }
@@ -243,7 +261,7 @@ struct HubspotChatWebView: UIViewRepresentable {
         coordinator.urlHandler = context.environment.openURL
 
         configuration.applicationNameForUserAgent = applicationNameForUserAgent
-        configuration.websiteDataStore = .default()
+        configuration.websiteDataStore = manager.websiteDataStore(withPushData: pushData, forChatFlow: chatFlow)
 
         configuration.dataDetectorTypes = [.phoneNumber]
 
@@ -299,6 +317,8 @@ struct HubspotChatWebView: UIViewRepresentable {
                 withPushData: pushData,
                 forChatFlow: chatFlow
             )
+            context.coordinator.shouldForceNewThreadOnLoad = openToNewThread
+            context.coordinator.resolvedChatFlow = manager.resolveChatFlow(withPushData: pushData, forChatFlow: chatFlow)
             let request = URLRequest(url: urlToLoad)
 
             Task {
@@ -339,6 +359,25 @@ struct HubspotChatWebView: UIViewRepresentable {
         let contentController = WKUserContentController()
 
         var mainLoadNavReference: WKNavigation?
+
+        /// Mirrors ``HubspotChatWebView/openToNewThread``. When true, once the widget reports it has
+        /// loaded, we force it to start a new conversation thread instead of resuming whatever thread
+        /// the visitor's identity cookies point to.
+        var shouldForceNewThreadOnLoad = false
+
+        /// The chat flow resolved for the current load - reported to the manager alongside any thread
+        /// id extracted from the JS bridge, so ``HubspotManager/threadOpened``/``HubspotManager/threadOpenedCallback``
+        /// observers know which chat flow a thread belongs to.
+        var resolvedChatFlow: String?
+
+        /// Calls the HubSpot Chat Widget SDK's `widget.refresh` with `openToNewThread: true`, if the widget
+        ///  is present. This is the same mechanism HubSpot's web widget uses to avoid resuming a stale
+        ///  thread from a different chat flow.
+        private let forceNewThreadJS = """
+                if (window.HubSpotConversations && window.HubSpotConversations.widget && typeof window.HubSpotConversations.widget.refresh === 'function') {
+                    window.HubSpotConversations.widget.refresh({ openToNewThread: true });
+                }
+            """
 
         func setupScripts() {
             contentController.add(self, name: handlerName)
@@ -454,9 +493,14 @@ struct HubspotChatWebView: UIViewRepresentable {
                 }
 
                 // this message is sent on widget loading
-                if let message = dict["message"] as? String, message == "widget has loaded" {
+                if let messageText = dict["message"] as? String, messageText == "widget has loaded" {
                     Task {
                         await viewModel.didLoadWidget()
+                    }
+
+                    if shouldForceNewThreadOnLoad {
+                        shouldForceNewThreadOnLoad = false
+                        message.webView?.evaluateJavaScript(forceNewThreadJS)
                     }
                 }
 
@@ -467,12 +511,12 @@ struct HubspotChatWebView: UIViewRepresentable {
                     #if compiler(<6)
                         // Adding an assume isolated for Xcode 15 support - this isn't needed in Xcode 16, but the WKScriptMessageHandler doesn't have the main actor isolation
                         MainActor.assumeIsolated {
-                            manager.handleThreadOpened(threadId: String(conversationId))
+                            manager.handleThreadOpened(threadId: String(conversationId), chatFlow: resolvedChatFlow)
                         }
 
                     #else
                         // Now we know the id of newly selected thread, we can inform the manager which will handle next steps for data
-                        manager.handleThreadOpened(threadId: String(conversationId))
+                        manager.handleThreadOpened(threadId: String(conversationId), chatFlow: resolvedChatFlow)
                     #endif
                 }
             default:

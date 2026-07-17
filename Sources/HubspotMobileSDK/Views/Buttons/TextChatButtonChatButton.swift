@@ -15,6 +15,7 @@ public struct TextChatButton: View {
     private let customText: LocalizedStringKey?
     private let manager: HubspotManager
     private let chatFlow: String?
+    private let openToNewThread: Bool
 
     @State var showingChat: Bool = false
 
@@ -24,10 +25,14 @@ public struct TextChatButton: View {
     ///   - text: The text in the button - if nil, default text is used.
     ///   - manager: The manager to use for getting a chat session. By defautl the shared manager is used.
     ///   - chatFlow: The specific chat flow to open. Optional.
-    public init(text: LocalizedStringKey? = nil, manager: HubspotManager? = nil, chatFlow: String? = nil) {
+    ///   - openToNewThread: Forces the widget to start a new conversation thread instead of resuming the
+    ///                      visitor's last active thread - see ``HubspotChatView/init(manager:pushData:chatFlow:openToNewThread:dismissChat:)``.
+    ///                      Defaults to `false`.
+    public init(text: LocalizedStringKey? = nil, manager: HubspotManager? = nil, chatFlow: String? = nil, openToNewThread: Bool = false) {
         customText = text
         self.manager = manager ?? .shared
         self.chatFlow = chatFlow
+        self.openToNewThread = openToNewThread
     }
 
     public var body: some View {
@@ -54,7 +59,7 @@ public struct TextChatButton: View {
         .sheet(
             isPresented: $showingChat,
             content: {
-                HubspotChatView(manager: manager, chatFlow: chatFlow)
+                HubspotChatView(manager: manager, chatFlow: chatFlow, openToNewThread: openToNewThread)
             })
     }
 }

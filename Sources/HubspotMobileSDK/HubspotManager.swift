@@ -4,6 +4,7 @@
 // Copyright © 2024 Hubspot, Inc.
 
 import Combine
+import CryptoKit
 import Foundation
 import OSLog
 import SwiftUI
@@ -74,6 +75,16 @@ public class HubspotManager: NSObject, ObservableObject {
 
     /// Publisher triggered when user opens a hubspot message. Only triggered when manager is acting as the UNNotificationDelegate, or notifications are forwarded to the ``userNotificationCenter(_:didReceive:withCompletionHandler:)`` method on this manager instance.
     public private(set) var newMessage: PassthroughSubject<PushNotificationChatData, Never> = PassthroughSubject()
+
+    /// Callback triggered whenever the chat widget starts a new conversation or the visitor selects
+    /// an existing one.
+    ///
+    /// Read-only - useful for your own persistence or analytics (for example, remembering which thread
+    /// was last active for a given chat flow); it does not control which thread the widget opens.
+    public var threadOpenedCallback: (ChatThreadInfo) -> Void = { _ in }
+
+    /// Publisher triggered whenever the chat widget starts a new conversation or the visitor selects an existing one.
+    public private(set) var threadOpened: PassthroughSubject<ChatThreadInfo, Never> = PassthroughSubject()
 
     /// The logger used by the SDK. to disable logging set to the disabled OSLog with  `Logger(.disabled)`, or set a custom Logger with a preferred subsystem and category
     public var logger = createDefaultHubspotLogger() {
@@ -395,15 +406,101 @@ public class HubspotManager: NSObject, ObservableObject {
         chatProperties = [:]
 
         Task {
-            //The Hubspot chat view currently uses the default web data store
-            let cookieStore = WKWebsiteDataStore.default().httpCookieStore
-            let matchingCookies = await cookieStore.allCookies().filter { cookiesToDeleteWhenClearingData.contains($0.name) }
-            for cookie in matchingCookies {
-                await cookieStore.deleteCookie(cookie)
-            }
+            await clearIdentityCookiesFromAllDataStores()
         }
 
         objectWillChange.send()
+    }
+
+    /// Removes the identity cookies from the default data store, as well as every chat-flow-scoped
+    /// data store the chat view may have created.
+    ///
+    /// Since each chat flow keeps its own isolated data store, clearing user data needs to sweep all
+    /// of them individually to fully reset identity across every chat flow, not just whichever flow
+    /// happens to be open right now.
+    ///
+    /// See ``websiteDataStore(withPushData:forChatFlow:)``.
+    private func clearIdentityCookiesFromAllDataStores() async {
+        await clearIdentityCookies(from: .default())
+
+        guard #available(iOS 17.0, *) else {
+            return
+        }
+
+        let identifiers = await withCheckedContinuation { (continuation: CheckedContinuation<[UUID], Never>) in
+            WKWebsiteDataStore.fetchAllDataStoreIdentifiers { identifiers in
+                continuation.resume(returning: identifiers)
+            }
+        }
+
+        for identifier in identifiers {
+            await clearIdentityCookies(from: WKWebsiteDataStore(forIdentifier: identifier))
+        }
+    }
+
+    private func clearIdentityCookies(from dataStore: WKWebsiteDataStore) async {
+        let cookieStore = dataStore.httpCookieStore
+        let matchingCookies = await cookieStore.allCookies().filter { cookiesToDeleteWhenClearingData.contains($0.name) }
+        for cookie in matchingCookies {
+            await cookieStore.deleteCookie(cookie)
+        }
+    }
+
+    /// Resolves the chat flow to use given push data and an optionally requested chat flow, following the
+    /// same precedence used when building the chat url: push data, then the requested flow, then the
+    /// configured default.
+    func resolveChatFlow(withPushData: PushNotificationChatData?, forChatFlow: String?) -> String? {
+        if let chatFlow = withPushData?.chatflow, !chatFlow.isEmpty {
+            return chatFlow
+        } else if let chatFlow = forChatFlow, !chatFlow.isEmpty {
+            return chatFlow
+        } else if let defaultChatFlow, !defaultChatFlow.isEmpty {
+            return defaultChatFlow
+        }
+        return nil
+    }
+
+    /// Deterministically derives a stable identifier for a chat flow's isolated website data store from
+    /// the portal id and chat flow name.
+    ///
+    /// The same inputs always produce the same identifier, so a given chat flow reuses its own persistent,
+    /// isolated data store across app launches, and different chat flows never collide.
+    private static func dataStoreIdentifier(portalId: String, chatFlow: String) -> UUID {
+        let digest = SHA256.hash(data: Data("\(portalId)|\(chatFlow)".utf8))
+        var bytes = Array(digest.prefix(16))
+        // Force valid UUID version/variant bits - not required functionally, but keeps the identifier looking like a well formed UUID
+        bytes[6] = (bytes[6] & 0x0F) | 0x50
+        bytes[8] = (bytes[8] & 0x3F) | 0x80
+        return bytes.withUnsafeBufferPointer { NSUUID(uuidBytes: $0.baseAddress!) as UUID }
+    }
+
+    /// Returns the website data store to use for a chat session with the given push data / chat flow.
+    ///
+    /// Each chat flow gets its own persistent, isolated data store (see ``dataStoreIdentifier(portalId:chatFlow:)``),
+    /// rather than sharing the default, global data store. HubSpot's chat widget resumes the visitor's
+    /// most recently active conversation thread based on identity cookies - if every chat flow shared one
+    /// data store, opening a different chat flow than the one last used would resume that other flow's
+    /// conversation instead of starting its own. Isolating cookies per chat flow keeps each flow's visitor
+    /// identity, and therefore its active thread, independent of every other flow.
+    ///
+    /// Falls back to the default, shared data store if a chat flow can't be resolved yet (e.g. missing
+    /// configuration) - ``HubspotChatView`` handles that case separately by showing a configuration error
+    /// instead of loading anything.
+    ///
+    /// - Parameters:
+    ///     - withPushData: The struct with data from push notification
+    ///     - forChatFlow: The chat flow to open.
+    ///
+    func websiteDataStore(withPushData: PushNotificationChatData?, forChatFlow: String?) -> WKWebsiteDataStore {
+        guard #available(iOS 17.0, *),
+            let portalId,
+            let resolvedChatFlow = resolveChatFlow(withPushData: withPushData, forChatFlow: forChatFlow)
+        else {
+            return .default()
+        }
+
+        let identifier = Self.dataStoreIdentifier(portalId: portalId, chatFlow: resolvedChatFlow)
+        return WKWebsiteDataStore(forIdentifier: identifier)
     }
 
     /// Computes the url for the current config for embedding chat, based on any known config for portal id, hublet, user id, etc
@@ -424,6 +521,11 @@ public class HubspotManager: NSObject, ObservableObject {
             throw HubspotConfigError.missingConfiguration
         }
 
+        guard let resolvedChatFlow = resolveChatFlow(withPushData: withPushData, forChatFlow: forChatFlow) else {
+            // No chatflow, but we know we need one
+            throw HubspotConfigError.missingChatFlow
+        }
+
         let hubletModel = Hublet(id: hublet, environment: environment)
 
         var components = URLComponents()
@@ -435,6 +537,7 @@ public class HubspotManager: NSObject, ObservableObject {
             "portalId": portalId,
             "hublet": hubletModel.id,
             "env": environment.rawValue,
+            "chatflow": resolvedChatFlow,
         ]
 
         if let idToken = userIdentityToken {
@@ -443,18 +546,6 @@ public class HubspotManager: NSObject, ObservableObject {
 
         if let email = userEmailAddress {
             queryItems["email"] = email
-        }
-
-        // Use chat flow from push data, if exsist, otherwise use chat flow dedicated property
-        if let chatFlow = withPushData?.chatflow, !chatFlow.isEmpty {
-            queryItems["chatflow"] = chatFlow
-        } else if let chatFlow = forChatFlow, !chatFlow.isEmpty {
-            queryItems["chatflow"] = chatFlow
-        } else if let defaultChatFlow, !defaultChatFlow.isEmpty {
-            queryItems["chatflow"] = defaultChatFlow
-        } else {
-            // No chatflow, but we know we need one
-            throw HubspotConfigError.missingChatFlow
         }
 
         var urlNoPlus = CharacterSet.urlQueryAllowed
@@ -481,9 +572,21 @@ public class HubspotManager: NSObject, ObservableObject {
         return url
     }
 
-    /// Handle obtaining a thread id - once the thread id is known , we can post chat properties to the API. This method is used by chat views once they've extracted ID from UI / Javascript Bridge.
-    /// - Parameter threadId: the thread id retrieved from the active chat view
-    func handleThreadOpened(threadId: String) {
+    /// Handle obtaining a thread id - once the thread id is known , we can post chat properties to
+    /// the API, and report it via ``threadOpened``/``threadOpenedCallback``.
+    ///
+    /// This method is used by chat views once they've extracted ID from UI / Javascript Bridge.
+    /// 
+    /// - Parameters:
+    ///   - threadId: the thread id retrieved from the active chat view
+    ///   - chatFlow: the chat flow this thread belongs to, if resolvable
+    func handleThreadOpened(threadId: String, chatFlow: String?) {
+        if let chatFlow {
+            let info = ChatThreadInfo(chatFlow: chatFlow, threadId: threadId)
+            threadOpenedCallback(info)
+            threadOpened.send(info)
+        }
+
         guard let portalId, let hubletModel else {
             return
         }
